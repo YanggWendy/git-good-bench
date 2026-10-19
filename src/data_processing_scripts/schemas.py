@@ -1,4 +1,7 @@
-from yt.wrapper import yt_dataclass
+try:
+    from yt.wrapper import yt_dataclass
+except ImportError:  # ytsaurus-client is only needed to read the internal YT dataset table
+    from dataclasses import dataclass as yt_dataclass
 from typing import Optional
 from dataclasses import dataclass
 

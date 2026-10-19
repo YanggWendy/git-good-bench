@@ -247,24 +247,23 @@ class Evaluator:
         return response_agent_gt['evaluation_result'] == 'HISTORY-1' and response_gt_agent[
             'evaluation_result'] == 'HISTORY-2'
 
-    def _prompt_model_with(self, prompt: Chat):
+    def _prompt_model_with(self, prompt):
         """
         Abstraction wrapper for LLM backend communication.
 
+        The LLM client of the original setup is not part of the release. Only the
+        LLM-as-a-judge evaluation of the file-commit-chain scenarios needs it;
+        merge scenarios are evaluated by exact match.
+
         Args:
-            prompt (Chat): The chat prompt containing the input for the language model.
+            prompt: The chat prompt containing the input for the language model.
 
         Returns:
             Any: The response from the language model after processing the given prompt.
         """
-        return self.llm_client.chat(
-            chat=prompt,
-            profile=LLM ..,
-            parameters={
-                LLMParameters.Temperature: Parameters.FloatValue(0),
-                LLMParameters.ResponseFormat: Parameters.JsonValue(self.response_schema),
-            }
-        )
+        if self.llm_client is None:
+            raise NotImplementedError('No LLM client is configured for the LLM-as-a-judge evaluation.')
+        return self.llm_client.chat(prompt, temperature=0, response_schema=self.response_schema)
 
     def _build_git_history(self, commits):
         """
