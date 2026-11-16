@@ -11,6 +11,68 @@ On Git" published at the 1st Workshop for Research on Agent Language Models (REA
 
 For details on the construction of our dataset and supported scenarios, we refer the to our paper.
 
+## Harbor parity: reference harness for CLI agents (`harbor-parity` branch)
+
+This branch is the original-benchmark side of the parity experiment of the
+GitGoodBench adapter for [Harbor](https://github.com/harbor-framework/harbor)
+([adapter PR](https://github.com/harbor-framework/adapters/pull/78)). It is
+`JetBrains-Research/git-good-bench@b11ae6cd92be2b8b96e237d379427e04ad59c455`
+plus one commit that makes the released agent client runnable end to end with a
+standard CLI coding agent:
+
+- the samples are read from the public HuggingFace release
+  (`JetBrains/git_good_bench-lite`) instead of the internal table
+  (`src/agent_client/data/hf_dataset_provider.py`);
+- the agent is a CLI agent working in the scenario container
+  (`src/agent_client/agents/cli_agent.py`: mini-swe-agent, Codex CLI, an oracle
+  and a no-op control) and gets the original merge prompt with the custom-tool
+  section replaced by shell instructions
+  (`src/agent_client/data/cli_prompt_provider.py`);
+- `src/agent_client/run_cli_agent_benchmark.py` runs the loop: clone, scenario
+  setup, agent, evaluation, teardown.
+
+The scenario setup (`ScenarioEnvironmentManager`) and the scoring (`Evaluator`)
+are the released code, except for two one-line fixes needed to import them.
+Only merge scenarios are supported.
+
+To reproduce the original side of the parity experiment (mini-swe-agent 2.4.6
+with `deepseek-v4.1-flash` over an OpenAI-compatible chat completions endpoint,
+3 runs over the 60 GitGoodBench Lite merge samples):
+
+```bash
+git clone -b harbor-parity https://github.com/YanggWendy/git-good-bench.git
+cd git-good-bench
+docker build -f docker/cli-agent.Dockerfile -t gitgoodbench-cli-agent .
+pip install docker datasets "mini-swe-agent==2.4.6" "litellm==1.91.1"  # host side
+
+export OPENAI_API_KEY=<parity gateway key>
+export OPENAI_BASE_URL=https://app-us.ppapi.ai/v1
+python -m src.agent_client.run_cli_agent_benchmark --agent mini-swe-agent \
+    --model openai/deepseek-v4.1-flash --image gitgoodbench-cli-agent \
+    --hide-ground-truth --runs 3 --run-name mswea-deepseek-v4.1-flash-aligned
+python -m src.agent_client.summarize_cli_agent_results \
+    results/mswea-deepseek-v4.1-flash-aligned/results.jsonl
+```
+
+- `--hide-ground-truth` keeps the ground-truth merge commit away from the agent,
+  as the Harbor task images do: the commit is exported to a bundle on the host,
+  every ref except `current-scenario-branch` and the incoming parent is deleted,
+  the `origin` remote is removed and the container is detached from its
+  networks; the bundle is fetched back before the evaluation.
+- `--agent oracle` commits the ground-truth merge (expected 60/60) and
+  `--agent nop` does nothing (expected 0).
+- `--shard k/n` runs disjoint subsets in parallel processes; the results file is
+  resumable.
+- On macOS, put `--work-dir` on a case-sensitive volume: some repositories have
+  paths that differ only by case.
+- The image defaults to `python:3.10-slim`, the base of the original harness
+  container; the parity runs used `--build-arg BASE_IMAGE=ubuntu:24.04`.
+
+Parity result (solve rate, mean ± sample SEM over 3 runs): 40.56 ± 2.00 with
+this harness and 41.67 ± 0.96 with the Harbor adapter. The setup, the known
+differences between the two sides and the per-run results are documented in
+`src/gitgoodbench/parity/README.md` of the adapter.
+
 ## Scraping Repositories
 You can use the `RepositoryDataScraper` to scrape your own repository or extend it
 to mine additional scenarios for AI Agents. In either case, follow the setup instructions in this section to
