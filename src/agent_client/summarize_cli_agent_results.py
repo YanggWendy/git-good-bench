@@ -13,19 +13,26 @@ from pathlib import Path
 
 
 def summarize(results_file: Path) -> None:
-    # With --retry-errors a (sample, run) pair can appear more than once; the last record counts.
+    # With --retry-errors a (sample, scenario, run) triple can appear more than once; the last record counts.
     latest = {}
     for line in results_file.read_text().splitlines():
         if line.strip():
             record = json.loads(line)
-            latest[(record['sample_id'], record['run'])] = record
-    records = list(latest.values())
-    if not records:
+            record.setdefault('scenario_type', 'merge')
+            latest[(record['sample_id'], record['scenario_type'], record['run'])] = record
+    if not latest:
         print(f'{results_file}: no results')
         return
+    for scenario_type in sorted({record['scenario_type'] for record in latest.values()}):
+        summarize_scenario(results_file, scenario_type,
+                           [record for record in latest.values() if record['scenario_type'] == scenario_type])
+
+
+def summarize_scenario(results_file: Path, scenario_type: str, records: list) -> None:
     runs = sorted({record['run'] for record in records})
     samples = sorted({record['sample_id'] for record in records})
-    print(f'{results_file}: {len(samples)} samples, runs {runs}, agent={records[0]["agent"]} model={records[0].get("model")}')
+    print(f'{results_file} [{scenario_type}]: {len(samples)} samples, runs {runs}, agent={records[0]["agent"]} '
+          f'model={records[0].get("model")}')
 
     rates = []
     for run in runs:

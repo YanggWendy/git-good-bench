@@ -8,6 +8,7 @@ from docker.models.containers import Container
 
 from src.agent_client.environment.scenario_type import ScenarioType
 from src.agent_client.utils.exceptions import ScenarioEnvironmentException
+from src.agent_client.utils.judge_client import Chat
 
 class Evaluator:
 

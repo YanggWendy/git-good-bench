@@ -17,7 +17,7 @@ This branch is the original-benchmark side of the parity experiment of the
 GitGoodBench adapter for [Harbor](https://github.com/harbor-framework/harbor)
 ([adapter PR](https://github.com/harbor-framework/adapters/pull/78)). It is
 `JetBrains-Research/git-good-bench@b11ae6cd92be2b8b96e237d379427e04ad59c455`
-plus one commit that makes the released agent client runnable end to end with a
+plus the changes that make the released agent client runnable end to end with a
 standard CLI coding agent:
 
 - the samples are read from the public HuggingFace release
@@ -25,15 +25,20 @@ standard CLI coding agent:
   (`src/agent_client/data/hf_dataset_provider.py`);
 - the agent is a CLI agent working in the scenario container
   (`src/agent_client/agents/cli_agent.py`: mini-swe-agent, Codex CLI, an oracle
-  and a no-op control) and gets the original merge prompt with the custom-tool
-  section replaced by shell instructions
+  and a no-op control) and gets the original prompts with the custom-tool
+  sections replaced by shell instructions
   (`src/agent_client/data/cli_prompt_provider.py`);
+- the LLM judge of the interactive rebase and iterative committing scenarios
+  gets a client for an OpenAI-compatible chat completions API
+  (`src/agent_client/utils/judge.py`, the module the Harbor tasks use, and
+  `src/agent_client/utils/judge_client.py`);
 - `src/agent_client/run_cli_agent_benchmark.py` runs the loop: clone, scenario
   setup, agent, evaluation, teardown.
 
 The scenario setup (`ScenarioEnvironmentManager`) and the scoring (`Evaluator`)
-are the released code, except for two one-line fixes needed to import them.
-Only merge scenarios are supported.
+are the released code, except for three one-line fixes needed to import them.
+All three scenarios are supported: `--scenario-types merge` (the default),
+`chunk` (iterative committing) and `rebase` (interactive rebase).
 
 To reproduce the original side of the parity experiment (mini-swe-agent 2.4.6
 with `deepseek-v4.1-flash` over an OpenAI-compatible chat completions endpoint,
@@ -61,6 +66,11 @@ python -m src.agent_client.summarize_cli_agent_results \
   networks; the bundle is fetched back before the evaluation.
 - `--agent oracle` commits the ground-truth merge (expected 60/60) and
   `--agent nop` does nothing (expected 0).
+- `--scenario-types chunk rebase` runs the two scenarios of the
+  `file_commit_chain` samples. Their judge reads `OPENAI_API_KEY`,
+  `OPENAI_BASE_URL` and `JUDGE_MODEL` (default `gpt-4o`). The oracle of these
+  scenarios is the original history, which the judge can only call a tie;
+  `--oracle-mode` counts it as solved without asking the judge.
 - `--shard k/n` runs disjoint subsets in parallel processes; the results file is
   resumable.
 - On macOS, put `--work-dir` on a case-sensitive volume: some repositories have

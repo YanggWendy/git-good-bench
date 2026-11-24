@@ -1,4 +1,4 @@
-"""Run a standard CLI coding agent on GitGoodBench merge scenarios.
+"""Run a standard CLI coding agent on GitGoodBench scenarios.
 
 The released agent client (``run_agent_client.py``) has two pieces removed: the
 dataset source (an internal YTsaurus table) and the agent loop (an early
@@ -14,13 +14,19 @@ that the benchmark can be executed end to end:
 * ``ScenarioEnvironmentManager`` (scenario setup/teardown) and ``Evaluator``
   (scoring) are used unchanged.
 
-Only the merge conflict resolution scenario is supported (exact match against
-the ground-truth merge commit, no LLM judge). Results are appended to
-``<results-dir>/<run-name>/results.jsonl`` (one line per sample and run) and
-the agent logs are kept under ``<results-dir>/<run-name>/logs/<sample id>/run-<k>/``.
-Re-running with the same ``--run-name`` skips (sample, run) pairs that already
-have a result, and ``--shard k/n`` lets several processes (each with its own
-container) work on disjoint samples.
+``--scenario-types`` selects the scenarios: ``merge`` (merge conflict
+resolution, exact match against the ground-truth merge commit, the default),
+``chunk`` (iterative committing) and ``rebase`` (interactive rebase). The last
+two come from the ``file_commit_chain`` samples and are scored by the
+Evaluator's LLM judge, for which ``utils/judge_client.py`` provides the client
+(``OPENAI_API_KEY``, ``OPENAI_BASE_URL``, ``JUDGE_MODEL``).
+
+Results are appended to ``<results-dir>/<run-name>/results.jsonl`` (one line
+per sample, scenario and run) and the agent logs are kept under
+``<results-dir>/<run-name>/logs/<sample id>[-chunk|-rebase]/run-<k>/``.
+Re-running with the same ``--run-name`` skips what already has a result, and
+``--shard k/n`` lets several processes (each with its own container) work on
+disjoint samples.
 
 Example (Codex via an OpenAI-compatible gateway, 3 runs on GitGoodBench Lite):
 
@@ -54,6 +60,8 @@ from src.agent_client.environment.scenario_environment_manager import ScenarioEn
 from src.agent_client.environment.scenario_type import ScenarioType
 from src.agent_client.utils.available_context import AvailableContext
 from src.agent_client.utils.exceptions import ScenarioEnvironmentException
+from src.agent_client.utils import judge
+from src.agent_client.utils.judge_client import JudgeClient
 from src.data_processing_scripts.schemas import SampleDataRowV4
 
 CONTAINER_WORK_DIR = '/usr/code'
@@ -66,6 +74,21 @@ MERGE_CONTEXTS = [
     AvailableContext.ALL_MERGE_CONFLICTS,
 ]
 AGENT_ENV_VARS = ('OPENAI_API_KEY', 'OPENAI_BASE_URL')
+# Command line names of the scenarios. A file_commit_chain sample is run as
+# chunk, then rebase, the order of run_agent_client.py.
+SCENARIO_TYPES = {
+    'merge': ScenarioType.MERGE,
+    'chunk': ScenarioType.FILE_COMMIT_CHAIN_CHUNK,
+    'rebase': ScenarioType.FILE_COMMIT_CHAIN_REBASE,
+}
+SCENARIO_NAMES = {scenario_type: name for name, scenario_type in SCENARIO_TYPES.items()}
+SAMPLE_TYPE_OF = {'merge': 'merge', 'chunk': 'file_commit_chain', 'rebase': 'file_commit_chain'}
+SEQUENCE_EDITOR = Path(__file__).resolve().parents[2] / 'agent_work_dir' / 'sequence_editor.sh'
+
+
+def unit_id(sample_id: str, scenario_type: ScenarioType) -> str:
+    """Name of a (sample, scenario) pair: the sample id, with the scenario appended for file-commit chains."""
+    return sample_id if scenario_type is ScenarioType.MERGE else f'{sample_id}-{SCENARIO_NAMES[scenario_type]}'
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,6 +99,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sample-ids', nargs='*', default=None, help='Only run these sample ids')
     parser.add_argument('--limit', type=int, default=None, help='Only run the first N (sorted) samples')
     parser.add_argument('--shard', default='0/1', help='k/n: run every n-th sample starting at index k')
+    parser.add_argument('--scenario-types', nargs='+', choices=sorted(SCENARIO_TYPES), default=['merge'],
+                        help='Scenarios to run (default: merge). chunk and rebase are the two scenarios of the '
+                             'file_commit_chain samples and need the LLM judge')
     parser.add_argument('--agent', choices=['codex', 'mini-swe-agent', 'oracle', 'nop'], default='codex')
     parser.add_argument('--model', default=None,
                         help='Model name passed to the agent (codex: provider model id; mini-swe-agent: litellm name such as openai/<model>)')
@@ -92,10 +118,15 @@ def parse_args() -> argparse.Namespace:
                         help='Host directory bind-mounted at /usr/code in the container (default: %(default)s)')
     parser.add_argument('--agent-timeout', type=int, default=1800, help='Seconds per agent run (default: %(default)s)')
     parser.add_argument('--hide-ground-truth', action='store_true',
-                        help='After the scenario is set up, drop every ref except the scenario branch and the incoming '
-                             'parent and prune the clone, so that the ground-truth merge commit is not in the container '
-                             'while the agent works (as in the Harbor task images); it is restored from a bundle before '
-                             'the evaluation. The clone is re-created for the next run.')
+                        help='After the scenario is set up, drop every ref the scenario does not need and prune the '
+                             'clone, so that the ground truth (the merge commit, or the commits of an iterative '
+                             'committing scenario) is not in the container while the agent works (as in the Harbor '
+                             'task images); it is restored from a bundle before the evaluation. The clone is '
+                             're-created for the next run.')
+    parser.add_argument('--oracle-mode', action='store_true',
+                        help='For oracle runs of the judge-scored scenarios: a history made of exactly the original '
+                             'commits counts as solved without asking the judge (ORACLE_MODE of the Harbor tasks). '
+                             'The judge can only call such a history a tie.')
     parser.add_argument('--retry-errors', action='store_true',
                         help='Re-run (sample, run) pairs whose previous result was not an evaluation')
     parser.add_argument('--log-level', default='INFO')
@@ -112,8 +143,8 @@ def parse_shard(value: str) -> Tuple[int, int]:
     return index, count
 
 
-def load_done(results_file: Path, retry_errors: bool = False) -> Set[Tuple[str, int]]:
-    """(sample id, run) pairs that already have a result; with retry_errors only evaluated ones count."""
+def load_done(results_file: Path, retry_errors: bool = False) -> Set[Tuple[str, str, int]]:
+    """(sample id, scenario type, run) triples that already have a result; with retry_errors only evaluated ones count."""
     done = set()
     if results_file.exists():
         for line in results_file.read_text().splitlines():
@@ -121,7 +152,7 @@ def load_done(results_file: Path, retry_errors: bool = False) -> Set[Tuple[str, 
                 record = json.loads(line)
                 if retry_errors and record.get('status') != 'evaluated':
                     continue
-                done.add((record['sample_id'], record['run']))
+                done.add((record['sample_id'], record.get('scenario_type', ScenarioType.MERGE.value), record['run']))
     return done
 
 
@@ -181,7 +212,11 @@ def ensure_scenario_commits(container, manager: ScenarioEnvironmentManager, scen
     # Never let automatic garbage collection run in the background while the scenario is prepared.
     container.exec_run('git config gc.auto 0', workdir=manager.repository_work_dir)
     fetched = []
-    for commit in [scenario['merge_commit_hash'], *scenario['parents']]:
+    if 'merge_commit_hash' in scenario:
+        commits = [scenario['merge_commit_hash'], *scenario['parents']]
+    else:
+        commits = [scenario['newest_commit']]
+    for commit in commits:
         err_code, _ = container.exec_run(f'git cat-file -e {commit}^{{commit}}', workdir=manager.repository_work_dir)
         if err_code == 0:
             continue
@@ -194,7 +229,63 @@ def ensure_scenario_commits(container, manager: ScenarioEnvironmentManager, scen
 
 
 GROUND_TRUTH_REF = 'refs/gitgoodbench/ground-truth'
-INCOMING_REF = 'refs/gitgoodbench/incoming'
+# The agent can list refs, so the name does not mention the benchmark (the Harbor task images use the same name).
+INCOMING_REF = 'refs/scenario/incoming'
+
+
+def run_steps(container, manager: ScenarioEnvironmentManager, steps: List[str], label: str) -> None:
+    for step in steps:
+        # A background `git gc --auto` spawned by the clone/fetch can hold the ref locks for a while.
+        for attempt in range(6):
+            err_code, output = container.exec_run(['bash', '-c', step], workdir=manager.repository_work_dir)
+            if err_code == 0:
+                break
+            if b'Another git process' in output and attempt < 5:
+                time.sleep(10)
+                continue
+            raise ScenarioEnvironmentException(f'{label}: {step!r} failed: {output.decode("utf-8", "replace")}')
+
+
+def hide_chain_ground_truth(container, manager: ScenarioEnvironmentManager, scenario_type: ScenarioType,
+                            scenario: dict, bundle: str) -> None:
+    """Reduces the clone of a file-commit-chain scenario to what the Harbor task image contains.
+
+    The original commits of the chain are saved to a bundle on the host, whose
+    only prerequisite is the commit before the chain; ``restore_ground_truth``
+    brings them back for the Evaluator. The ``origin`` remote and every ref
+    except the scenario branch are removed and unreachable objects are pruned.
+
+    * Iterative committing: the branch is at the commit before the chain, so
+      the commits of the chain, the ground truth of the scenario, are gone
+      afterwards.
+    * Interactive rebase: the commits of the chain are the input of the agent
+      and stay (the branch still points at the newest one while the rebase is
+      paused). The bundle only protects the evaluation against an agent that
+      prunes them.
+    """
+    newest = scenario['newest_commit']
+    base = f"{newest}~{scenario['times_seen_consecutively']}"
+    keep = f'refs/heads/{manager.AGENT_TARGET_BRANCH_NAME}'
+    steps = [
+        f'git update-ref {GROUND_TRUTH_REF} {newest}',
+        f'git bundle create --quiet /tmp/ground-truth.bundle {GROUND_TRUTH_REF} ^$(git rev-parse {base})',
+        'git remote remove origin',
+        # Symbolic refs (origin/HEAD) first, they cannot be batched with their targets.
+        "git for-each-ref --format='%(refname) %(symref)' | awk '$2 != \"\" {print $1}' "
+        "| while read -r ref; do git symbolic-ref -d \"$ref\"; done",
+        f"git for-each-ref --format='%(refname)' | grep -v -x -e {keep} | sed 's/^/delete /' | git update-ref --stdin",
+    ]
+    if scenario_type is ScenarioType.FILE_COMMIT_CHAIN_CHUNK:
+        steps.append('rm -f .git/FETCH_HEAD .git/ORIG_HEAD')
+    steps += ['git reflog expire --expire=now --all', 'git gc --prune=now --quiet']
+    run_steps(container, manager, steps, 'hide_ground_truth')
+    err_code, _ = container.exec_run(f'git cat-file -e {newest}^{{commit}}', workdir=manager.repository_work_dir)
+    if (err_code == 0) is (scenario_type is ScenarioType.FILE_COMMIT_CHAIN_CHUNK):
+        raise ScenarioEnvironmentException(
+            'hide_ground_truth: the original commits are still present after pruning'
+            if err_code == 0 else 'hide_ground_truth: the commits of the rebase were pruned')
+    docker_cp(f'{container.name}:/tmp/ground-truth.bundle', bundle)
+    container.exec_run('rm -f /tmp/ground-truth.bundle')
 
 
 def hide_ground_truth(container, manager: ScenarioEnvironmentManager, scenario: dict, bundle: str) -> None:
@@ -228,16 +319,7 @@ def hide_ground_truth(container, manager: ScenarioEnvironmentManager, scenario: 
         'git reflog expire --expire=now --all',
         'git gc --prune=now --quiet',
     ]
-    for step in steps:
-        # A background `git gc --auto` spawned by the clone/fetch can hold the ref locks for a while.
-        for attempt in range(6):
-            err_code, output = container.exec_run(['bash', '-c', step], workdir=manager.repository_work_dir)
-            if err_code == 0:
-                break
-            if b'Another git process' in output and attempt < 5:
-                time.sleep(10)
-                continue
-            raise ScenarioEnvironmentException(f'hide_ground_truth: {step!r} failed: {output.decode("utf-8", "replace")}')
+    run_steps(container, manager, steps, 'hide_ground_truth')
     err_code, _ = container.exec_run(f'git cat-file -e {merge_commit}^{{commit}}', workdir=manager.repository_work_dir)
     if err_code == 0:
         raise ScenarioEnvironmentException('hide_ground_truth: the ground-truth merge commit is still present after pruning')
@@ -247,7 +329,7 @@ def hide_ground_truth(container, manager: ScenarioEnvironmentManager, scenario: 
 
 
 def restore_ground_truth(container, manager: ScenarioEnvironmentManager, scenario: dict, bundle: str) -> None:
-    """Fetches the ground-truth merge commit back from the bundle saved by ``hide_ground_truth``."""
+    """Fetches the ground truth back from the bundle saved by ``hide_ground_truth``."""
     docker_cp(bundle, f'{container.name}:/tmp/ground-truth.bundle')
     err_code, output = container.exec_run(
         ['bash', '-c', f'git fetch --quiet /tmp/ground-truth.bundle {GROUND_TRUTH_REF}:{GROUND_TRUTH_REF} '
@@ -283,6 +365,82 @@ def set_network(container, connected: bool) -> None:
             raise ScenarioEnvironmentException(f'docker network {"connect" if connected else "disconnect"} failed: {result.stderr.strip()}')
 
 
+def exec_output(container, manager: ScenarioEnvironmentManager, command: str) -> str:
+    err_code, output = container.exec_run(['bash', '-c', command], workdir=manager.repository_work_dir)
+    if err_code != 0:
+        raise ScenarioEnvironmentException(f'{command!r} failed: {output.decode("utf-8", "replace")}')
+    return output.decode('utf-8')
+
+
+def rebase_participating_commits(container, manager: ScenarioEnvironmentManager) -> str:
+    """The commits of the paused rebase in ``<COMMIT-i>`` tags.
+
+    Same result as ``ScenarioEnvironmentManager._get_rebase_participating_commits``,
+    which reads the todo list from ``./agent_work_dir`` on the host and
+    therefore only works with the default work directory. The todo list is
+    read in the container here; the commits are shown with the same command.
+    """
+    participating_commits = ''
+    todo = exec_output(container, manager, 'cat .git/rebase-merge/git-rebase-todo')
+    for i, line in enumerate(line for line in todo.splitlines() if line.strip()):
+        command, commit = line.split()[:2]
+        if command != 'pick':
+            raise ScenarioEnvironmentException(f'Unexpected line in the rebase todo list: {line!r}')
+        participating_commits += f'<COMMIT-{i}>\n'
+        participating_commits += exec_output(container, manager, f'git show {commit}') + '\n'
+        participating_commits += f'</COMMIT-{i}>\n'
+    return participating_commits
+
+
+def build_prompt(container, manager: ScenarioEnvironmentManager, sample: SampleDataRowV4,
+                 scenario_type: ScenarioType, scenario: dict, record: Dict) -> str:
+    """The prompt of the scenario, from the same context the original prompt is built from."""
+    if scenario_type is ScenarioType.MERGE:
+        context = manager.provide_scenario_context(MERGE_CONTEXTS)
+        context[AvailableContext.PROGRAMMING_LANGUAGE] = sample.programming_language
+        record['total_number_of_merge_conflicts'] = context[AvailableContext.TOTAL_AMOUNT_OF_MERGE_CONFLICTS]
+        return CliPromptProvider.get_merge_prompt(scenario, context, manager.repository_work_dir)
+    if scenario_type is ScenarioType.FILE_COMMIT_CHAIN_CHUNK:
+        context = manager.provide_scenario_context([AvailableContext.REMAINING_HUNKS])
+        context[AvailableContext.PROGRAMMING_LANGUAGE] = sample.programming_language
+        record['number_of_hunks'] = context[AvailableContext.REMAINING_HUNKS][0]
+        return CliPromptProvider.get_chunk_prompt(scenario, context, manager.repository_work_dir)
+    context = {AvailableContext.PROGRAMMING_LANGUAGE: sample.programming_language,
+               AvailableContext.REBASE_PARTICIPATING_COMMITS: rebase_participating_commits(container, manager)}
+    return CliPromptProvider.get_rebase_prompt(scenario, context, manager.repository_work_dir)
+
+
+def is_original_history(container, manager: ScenarioEnvironmentManager, scenario: dict) -> bool:
+    """Whether the scenario branch holds exactly the original commits of the chain.
+
+    Both ends are found with the commands of the Evaluator: the original
+    history is ``git log -n N`` of the newest commit, the agent's history is
+    every commit of the branch before the commit that follows those.
+    """
+    count = scenario['times_seen_consecutively']
+    newest = scenario['newest_commit']
+    original = exec_output(container, manager, f'git log --format=%H -n {count} {newest}').split()
+    branch = exec_output(
+        container, manager, f'git log --format=%H -n {count + 1} {manager.AGENT_TARGET_BRANCH_NAME}').split()
+    exit_commit = exec_output(container, manager, f'git log --format=%H -n 1 --skip={count} {newest}').strip()
+    return branch == [*original, exit_commit]
+
+
+def history_reaches_start(container, manager: ScenarioEnvironmentManager, scenario: dict) -> bool:
+    """Whether the history of the scenario branch contains the commit the Evaluator stops at.
+
+    The Evaluator collects the agent's commits with ``git log -n 1 --skip=i``
+    until it reads the commit before the chain and never ends when the branch
+    does not contain it (the agent moved the branch somewhere else).
+    """
+    count = scenario['times_seen_consecutively']
+    exit_commit = exec_output(
+        container, manager, f"git log --format=%H -n 1 --skip={count} {scenario['newest_commit']}").strip()
+    err_code, output = container.exec_run(
+        ['bash', '-c', f'git log --format=%H {manager.AGENT_TARGET_BRANCH_NAME}'], workdir=manager.repository_work_dir)
+    return err_code == 0 and exit_commit in output.decode('utf-8', 'replace').split()
+
+
 def new_manager(container, sample: SampleDataRowV4, host_agent_work_dir: Path,
                 default_branch_name: Optional[str] = None) -> ScenarioEnvironmentManager:
     """A fresh manager per run: its conflict bookkeeping is not reusable across scenario setups."""
@@ -294,15 +452,18 @@ def new_manager(container, sample: SampleDataRowV4, host_agent_work_dir: Path,
 
 def run_scenario(container, manager: ScenarioEnvironmentManager, sample: SampleDataRowV4, scenario: dict,
                  run_index: int, agent: CliAgent, host_work_dir: Path, run_dir: Path,
-                 env_file: Optional[str], hide_ground_truth_commit: bool = False) -> Tuple[Dict, bool]:
+                 env_file: Optional[str], hide_ground_truth_commit: bool = False,
+                 scenario_type: ScenarioType = ScenarioType.MERGE, oracle_mode: bool = False) -> Tuple[Dict, bool]:
     """Sets up the scenario, runs the agent, evaluates and tears the scenario down.
 
     Returns:
         (record, repository_ok): the result record and whether the clone is still usable for the next run.
     """
-    sample_log_dir = run_dir / 'logs' / sample.id / f'run-{run_index}'
+    is_merge = scenario_type is ScenarioType.MERGE
+    label = f'{unit_id(sample.id, scenario_type)} run {run_index}'
+    sample_log_dir = run_dir / 'logs' / unit_id(sample.id, scenario_type) / f'run-{run_index}'
     sample_log_dir.mkdir(parents=True, exist_ok=True)
-    shared_rel = Path(SHARED_DIR_NAME) / sample.id / f'run-{run_index}'
+    shared_rel = Path(SHARED_DIR_NAME) / unit_id(sample.id, scenario_type) / f'run-{run_index}'
     host_shared_dir = host_work_dir / shared_rel
     container_shared_dir = f'{CONTAINER_WORK_DIR}/{shared_rel.as_posix()}'
     shutil.rmtree(host_shared_dir, ignore_errors=True)
@@ -313,7 +474,7 @@ def run_scenario(container, manager: ScenarioEnvironmentManager, sample: SampleD
         'repository': sample.name,
         'programming_language': sample.programming_language,
         'difficulty': sample.difficulty,
-        'scenario_type': ScenarioType.MERGE.value,
+        'scenario_type': scenario_type.value,
         'run': run_index,
         'agent': agent.name,
         'model': getattr(agent, 'model', None),
@@ -325,26 +486,27 @@ def run_scenario(container, manager: ScenarioEnvironmentManager, sample: SampleD
     repository_ok = True
     try:
         manager.set_scenario(copy.deepcopy(scenario))
-        manager.set_scenario_type(ScenarioType.MERGE)
+        manager.set_scenario_type(scenario_type)
         manager.setup_scenario_preconditions()
         bundle = str(sample_log_dir / 'ground-truth.bundle')  # host side only, never inside the bind mount
         if hide_ground_truth_commit:
-            hide_ground_truth(container, manager, scenario, bundle)
+            if is_merge:
+                hide_ground_truth(container, manager, scenario, bundle)
+            else:
+                hide_chain_ground_truth(container, manager, scenario_type, scenario, bundle)
             set_network(container, connected=False)
             record['ground_truth_hidden'] = True
             repository_ok = False  # the pruned clone is not reusable for another run
-        context = manager.provide_scenario_context(MERGE_CONTEXTS)
-        context[AvailableContext.PROGRAMMING_LANGUAGE] = sample.programming_language
-        prompt = CliPromptProvider.get_merge_prompt(scenario, context, manager.repository_work_dir)
+        prompt = build_prompt(container, manager, sample, scenario_type, scenario, record)
         (host_shared_dir / 'prompt.md').write_text(prompt)
         (sample_log_dir / 'prompt.md').write_text(prompt)
-        record['total_number_of_merge_conflicts'] = context[AvailableContext.TOTAL_AMOUNT_OF_MERGE_CONFLICTS]
         record['setup_s'] = round(time.time() - started, 1)
 
-        logging.info(f'[{sample.id} run {run_index}] running agent {agent.name}')
+        logging.info(f'[{label}] running agent {agent.name}')
         agent_run = agent.run(container.name, manager.repository_work_dir,
                               prompt_file=f'{container_shared_dir}/prompt.md',
-                              log_dir=container_shared_dir, scenario=scenario, env_file=env_file,
+                              log_dir=container_shared_dir,
+                              scenario={**scenario, 'scenario_type': scenario_type.value}, env_file=env_file,
                               host_prompt_file=str(host_shared_dir / 'prompt.md'),
                               host_log_dir=str(host_shared_dir))
         record['agent_exit_code'] = agent_run.exit_code
@@ -363,32 +525,46 @@ def run_scenario(container, manager: ScenarioEnvironmentManager, sample: SampleD
         if hide_ground_truth_commit:
             set_network(container, connected=True)
             restore_ground_truth(container, manager, scenario, bundle)
-        evaluator = Evaluator(container=container,
-                              agent_target_branch_name=manager.AGENT_TARGET_BRANCH_NAME,
-                              repository_work_dir=manager.repository_work_dir,
-                              llm_client=None,
-                              host_agent_work_dir=str(manager.host_agent_work_dir))
-        evaluator.set_scenario(scenario)
-        evaluator.set_scenario_type(ScenarioType.MERGE)
-        solved = bool(evaluator.evaluate())
+        if oracle_mode and not is_merge and is_original_history(container, manager, scenario):
+            # The judge can only call the original history a tie, which the first author agreed to count as solved.
+            solved = True
+            record['tie_counted_as_solved'] = True
+            evaluation = {'solved': True, 'reason': 'The history is the original history; --oracle-mode counts '
+                                                    'this tie as solved without asking the judge.'}
+        elif not is_merge and not history_reaches_start(container, manager, scenario):
+            solved = False
+            evaluation = {'solved': False, 'reason': f'The history of {manager.AGENT_TARGET_BRANCH_NAME} does not '
+                                                     'lead back to the commit the scenario started from.'}
+        else:
+            evaluator = Evaluator(container=container,
+                                  agent_target_branch_name=manager.AGENT_TARGET_BRANCH_NAME,
+                                  repository_work_dir=manager.repository_work_dir,
+                                  llm_client=None if is_merge else JudgeClient(),
+                                  host_agent_work_dir=str(manager.host_agent_work_dir))
+            evaluator.set_scenario(scenario)
+            evaluator.set_scenario_type(scenario_type)
+            solved = bool(evaluator.evaluate())
+            metadata = evaluator.get_evaluation_metadata()
+            evaluation = {'solved': solved,
+                          'agent_solution': metadata.get('agent_solution'),
+                          'ground_truth': metadata.get('ground_truth')}
+            if not is_merge:
+                llm_responses = metadata.get('llm_responses')
+                evaluation['llm_responses'] = json.loads(llm_responses) if llm_responses else None
         record['solved'] = solved
         record['status'] = 'evaluated'
-        metadata = evaluator.get_evaluation_metadata()
-        (sample_log_dir / 'evaluation.json').write_text(json.dumps(
-            {'solved': solved,
-             'agent_solution': metadata.get('agent_solution'),
-             'ground_truth': metadata.get('ground_truth')}, indent=2))
-        logging.info(f'[{sample.id} run {run_index}] {"solved" if solved else "not solved"}')
+        (sample_log_dir / 'evaluation.json').write_text(json.dumps(evaluation, indent=2))
+        logging.info(f'[{label}] {"solved" if solved else "not solved"}')
     except Exception as e:  # noqa: BLE001 - every failure is recorded, the loop goes on
         record['error'] = f'{type(e).__name__}: {e}'
-        logging.exception(f'[{sample.id} run {run_index}] failed')
+        logging.exception(f'[{label}] failed')
     finally:
-        kill_leftover_processes(container, f'{sample.id} run {run_index}')
+        kill_leftover_processes(container, label)
         if hide_ground_truth_commit:
             try:
                 set_network(container, connected=True)
             except Exception as e:  # noqa: BLE001
-                logging.warning(f'[{sample.id} run {run_index}] could not reconnect the container network: {e}')
+                logging.warning(f'[{label}] could not reconnect the container network: {e}')
             Path(bundle).unlink(missing_ok=True)
         try:
             manager.teardown_scenario()
@@ -396,7 +572,7 @@ def run_scenario(container, manager: ScenarioEnvironmentManager, sample: SampleD
             # Same recovery as run_agent_client.py: re-clone before the next scenario.
             record['teardown_error'] = f'{type(e).__name__}: {e}'
             if not hide_ground_truth_commit:
-                logging.warning(f'[{sample.id} run {run_index}] scenario teardown failed, the repository will be re-cloned: {e}')
+                logging.warning(f'[{label}] scenario teardown failed, the repository will be re-cloned: {e}')
             repository_ok = False
         shutil.rmtree(host_shared_dir, ignore_errors=True)
     record['duration_s'] = round(time.time() - started, 1)
@@ -436,8 +612,13 @@ def main() -> int:
 
     agent = build_agent(args.agent, model=args.model, base_url=args.base_url, wire_api=args.wire_api,
                         timeout_s=args.agent_timeout)
+    scenario_types = [SCENARIO_TYPES[name] for name in SCENARIO_TYPES if name in args.scenario_types]
+    if args.agent == 'oracle' and args.hide_ground_truth:
+        raise SystemExit('--agent oracle takes the ground truth from the clone and cannot be combined with '
+                         '--hide-ground-truth')
     provider = HFGitDatasetProvider(dataset_name=args.dataset, dataset_path=args.dataset_path,
-                                    sample_types=(ScenarioType.MERGE.value,), sample_ids=args.sample_ids)
+                                    sample_types=sorted({SAMPLE_TYPE_OF[name] for name in args.scenario_types}),
+                                    sample_ids=args.sample_ids)
     samples: List[SampleDataRowV4] = list(provider.stream_samples())
     if args.limit is not None:
         samples = samples[:args.limit]
@@ -451,12 +632,14 @@ def main() -> int:
     done = load_done(results_file, retry_errors=args.retry_errors)
     (run_dir / f'config-shard-{shard_index}.json').write_text(json.dumps({
         'dataset': args.dataset_path or args.dataset,
-        'scenario_type': ScenarioType.MERGE.value,
+        'scenario_types': [scenario_type.value for scenario_type in scenario_types],
         'samples': [sample.id for sample in samples],
         'runs': args.runs,
         'shard': args.shard,
         'image': args.image,
         'hide_ground_truth': args.hide_ground_truth,
+        'oracle_mode': args.oracle_mode,
+        'judge': judge.judge_settings() if any(t is not ScenarioType.MERGE for t in scenario_types) else None,
         'agent': agent.describe(),
         'started_at': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),
     }, indent=2))
@@ -471,13 +654,20 @@ def main() -> int:
     except docker.errors.NotFound:
         pass
     container = start_container(client, args.image, host_work_dir, container_name)
+    # The rebase scenario pauses the rebase with ../sequence_editor.sh, as run_agent_client.py sets it up.
+    shutil.copyfile(SEQUENCE_EDITOR, host_work_dir / 'sequence_editor.sh')
+    (host_work_dir / 'sequence_editor.sh').chmod(0o755)
     logging.info(f'Started container {container_name} from {args.image}; {len(samples)} samples x {args.runs} runs; '
                  f'{len(done)} results already in {results_file}')
 
     try:
         for position, sample in enumerate(samples, start=1):
-            pending_runs = [run for run in range(1, args.runs + 1) if (sample.id, run) not in done]
-            if not pending_runs:
+            sample_scenario_types = [scenario_type for scenario_type in scenario_types
+                                     if SAMPLE_TYPE_OF[SCENARIO_NAMES[scenario_type]] == sample.sample_type]
+            pending = [(scenario_type, run) for scenario_type in sample_scenario_types
+                       for run in range(1, args.runs + 1)
+                       if (sample.id, scenario_type.value, run) not in done]
+            if not pending:
                 logging.info(f'[{sample.id}] all runs done, skipping')
                 continue
             scenario = ast.literal_eval(sample.scenario)
@@ -491,23 +681,24 @@ def main() -> int:
                     logging.info(f'[{sample.id}] fetched {len(fetched)} scenario commit(s) missing from the clone')
             except Exception as e:  # noqa: BLE001
                 logging.error(f'[{sample.id}] could not set up repository: {e}')
-                for run in pending_runs:
+                for scenario_type, run in pending:
                     append_result(results_file, {
                         'sample_id': sample.id, 'repository': sample.name,
                         'programming_language': sample.programming_language, 'difficulty': sample.difficulty,
-                        'scenario_type': ScenarioType.MERGE.value, 'run': run, 'agent': agent.name,
+                        'scenario_type': scenario_type.value, 'run': run, 'agent': agent.name,
                         'model': getattr(agent, 'model', None), 'status': 'setup_error', 'solved': False,
                         'error': f'{type(e).__name__}: {e}'})
                 teardown_repository(manager)
                 continue
 
             default_branch_name = manager.default_branch_name
-            for run in pending_runs:
+            for scenario_type, run in pending:
                 record, repository_ok = run_scenario(container, manager, sample, scenario, run, agent,
                                                      host_work_dir, run_dir, env_file,
-                                                     hide_ground_truth_commit=args.hide_ground_truth)
+                                                     hide_ground_truth_commit=args.hide_ground_truth,
+                                                     scenario_type=scenario_type, oracle_mode=args.oracle_mode)
                 append_result(results_file, record)
-                if run != pending_runs[-1]:
+                if (scenario_type, run) != pending[-1]:
                     if not repository_ok:
                         teardown_repository(manager)
                         manager = new_manager(container, sample, host_agent_work_dir)

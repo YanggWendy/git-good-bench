@@ -239,17 +239,33 @@ class MiniSweAgent(CliAgent):
 
 
 class OracleAgent(CliAgent):
-    """Commits the ground-truth merge result.
+    """Reproduces the ground truth.
 
-    The original harness clones the complete repository, so the ground-truth
-    merge commit is available inside the container (unlike in the Harbor task
-    image, where it is purged). This agent validates the environment setup and
-    the evaluator: it must solve every scenario.
+    The original harness clones the complete repository, so the ground truth
+    is available inside the container (unlike in the Harbor task image, where
+    it is purged). This agent validates the environment setup and the
+    evaluator.
+
+    * merge: commits the ground-truth merge result, which must solve every
+      scenario.
+    * interactive rebase: executes the todo list as it is, which keeps the
+      original commits.
+    * iterative committing: puts the original commits on the branch.
+
+    The LLM judge can only call the original history a tie, so the last two
+    are solved with ``--oracle-mode`` only.
     """
 
     name = 'oracle'
 
     def command(self, prompt_file: str, log_dir: str, scenario: dict) -> str:
+        scenario_type = scenario.get('scenario_type', 'merge')
+        if scenario_type == 'file_commit_chain_scenario-rebase':
+            return 'git rebase --continue && git status && git log --oneline -8'
+        if scenario_type == 'file_commit_chain_scenario-chunk':
+            newest_commit = shlex.quote(scenario['newest_commit'])
+            return (f'git merge --quiet --ff-only {newest_commit} && rm -f all_changes.patch file_changes.patch '
+                    f'&& git status && git log --oneline -8')
         merge_commit = shlex.quote(scenario['merge_commit_hash'])
         return (f'git read-tree -u --reset {merge_commit} && git commit -q --no-edit '
                 f'&& git status && git log --oneline -3')
